@@ -1,0 +1,149 @@
+<!-- index.html -->
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>SSH Web Client</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm/css/xterm.css" />
+  <style>
+    body, html { margin: 0; height: 100%; }
+    #terminal { height: 100%; width: 100%; }
+    #keyInput { position: absolute; top: 10px; left: 10px; z-index: 100; background: white; padding: 0.5em; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <div id="keyInput">
+    <input type="file" id="keyFile" accept=".key,.pem" />
+    <button onclick="startSession()">Connect</button>
+  </div>
+  <div id="terminal"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/xterm/lib/xterm.js"></script>
+  <script src="/wasm_exec.js"></script>
+  <script>
+    let privateKeyRaw = null;
+    const go = new Go();
+
+    /**
+     * Parse an OpenSSH ed25519 private key PEM and extract the 32-byte seed.
+     */
+    function parseOpenSSHSeed(pem) {
+      const b64 = pem.replace(/-----BEGIN OPENSSH PRIVATE KEY-----/, "")
+                     .replace(/-----END OPENSSH PRIVATE KEY-----/, "")
+                     .replace(/\s+/g, "");
+      const raw = atob(b64);
+      const buf = Uint8Array.from(raw, c => c.charCodeAt(0));
+      const dv = new DataView(buf.buffer);
+      const magic = "openssh-key-v1\0";
+      const magicBytes = new TextEncoder().encode(magic);
+      let offset = magicBytes.length;
+      // verify magic header
+      for (let i = 0; i < magicBytes.length; i++) {
+        if (buf[i] !== magicBytes[i]) throw new Error("Invalid OpenSSH key format");
+      }
+      function readUInt32() {
+        const v = dv.getUint32(offset, false);
+        offset += 4;
+        return v;
+      }
+      function readString() {
+        const len = readUInt32();
+        const bytes = buf.subarray(offset, offset + len);
+        offset += len;
+        return new TextDecoder().decode(bytes);
+      }
+      const cipher = readString();
+      const kdf    = readString();
+      readString(); // kdf options
+      const nkeys  = readUInt32();
+      // skip public keys
+      for (let i = 0; i < nkeys; i++) {
+        const l = readUInt32(); offset += l;
+      }
+      // private keys blob
+      const privLen = readUInt32();
+      const priv    = buf.subarray(offset, offset + privLen);
+      const pdv     = new DataView(priv.buffer, priv.byteOffset, privLen);
+      let po = 0;
+      function readUInt32P() {
+        const v = pdv.getUint32(po, false);
+        po += 4;
+        return v;
+      }
+      function readStringP() {
+        const l = readUInt32P();
+        const b = priv.subarray(po, po + l);
+        po += l;
+        return b;
+      }
+      const check1 = readUInt32P();
+      const check2 = readUInt32P();
+      if (check1 !== check2) throw new Error("Checksum mismatch");
+      const algBytes = readStringP();
+      const alg      = new TextDecoder().decode(algBytes);
+      if (alg !== "ssh-ed25519") throw new Error("Only ed25519 keys are supported");
+      readStringP(); // public key
+      const privkey = readStringP();
+      return privkey.slice(0, 32);
+    }
+
+    document.getElementById("keyFile").addEventListener("change", async (event) => {
+      const file = event.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const arr = new Uint8Array(reader.result);
+          const decoder = new TextDecoder();
+          const text = decoder.decode(arr);
+          let seed;
+          if (text.includes("-----BEGIN OPENSSH PRIVATE KEY-----")) {
+            seed = parseOpenSSHSeed(text);
+          } else if (arr.length === 32) {
+            seed = arr;
+          } else {
+            alert("Invalid key file: must be a raw 32-byte seed or OpenSSH ed25519 private key.");
+            return;
+          }
+          // Base64-encode seed for WASM
+          privateKeyRaw = btoa(String.fromCharCode.apply(null, seed));
+        } catch (err) {
+          console.error(err);
+          alert("Error parsing key file: " + err.message);
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    });
+
+    async function startSession() {
+      const urlParams = new URLSearchParams(window.location.search);
+      const user = urlParams.get("user") || "root";
+      const addr = urlParams.get("addr") || "localhost:22";
+
+      if (!privateKeyRaw) {
+        alert("Please select a private key file.");
+        return;
+      }
+
+      console.log(privateKeyRaw)
+
+      const wasm = await WebAssembly.instantiateStreaming(fetch("main.wasm"), go.importObject);
+      window._wasm_user = user;
+      window._wasm_addr = addr;
+      window._wasm_key = privateKeyRaw;
+      go.run(wasm.instance);
+
+      const term = new Terminal();
+      term.open(document.getElementById('terminal'));
+
+      term.onData(data => {
+        if (typeof window.goHandleTermInput === 'function') {
+          window.goHandleTermInput(data);
+        }
+      });
+
+      window.goWriteToTerminal = (text) => term.write(text);
+    }
+  </script>
+</body>
+</html>

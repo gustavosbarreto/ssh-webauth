@@ -1,0 +1,171 @@
+// server/server.go
+package main
+
+import (
+	"crypto/ed25519"
+	"embed"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"sync"
+	"time"
+
+	"golang.org/x/crypto/ssh"
+	"github.com/gorilla/websocket"
+)
+
+//go:embed ../static/*
+var content embed.FS
+
+type Message struct {
+	Type string `json:"type"`
+	Data string `json:"data"`
+	User string `json:"user,omitempty"`
+	Addr string `json:"addr,omitempty"`
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+func main() {
+	http.Handle("/", http.FileServer(http.FS(content)))
+	http.HandleFunc("/ws", handleWebSocket)
+	log.Println("Server listening on :8080")
+	http.ListenAndServe(":8080", nil)
+}
+
+func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println("upgrade error:", err)
+		return
+	}
+	defer conn.Close()
+
+	var user, addr string
+	var once sync.Once
+	challenge := []byte("ssh-challenge")
+
+	err = conn.WriteJSON(Message{Type: "challenge", Data: string(challenge)})
+	if err != nil {
+		log.Println("send challenge error:", err)
+		return
+	}
+
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			log.Println("read error:", err)
+			return
+		}
+		var m Message
+		if err := json.Unmarshal(msg, &m); err != nil {
+			log.Println("json unmarshal error:", err)
+			continue
+		}
+
+		switch m.Type {
+		case "init":
+			user = m.User
+			addr = m.Addr
+			log.Println("Init received:", user, addr)
+		case "signature":
+			sig, err := base64.StdEncoding.DecodeString(m.Data)
+			if err != nil {
+				log.Println("decode signature error:", err)
+				return
+			}
+
+			pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICUJ6EtzQqvnBy5k4EV0W3nMX5JkHGCl2c+Y52PK6l1R"))
+			if err != nil {
+				log.Println("parse pubkey error:", err)
+				return
+			}
+
+			edPub, ok := pub.(ssh.CryptoPublicKey)
+			if !ok {
+				log.Println("not crypto pubkey")
+				return
+			}
+
+			goPub := edPub.CryptoPublicKey().(ed25519.PublicKey)
+			if !ed25519.Verify(goPub, challenge, sig) {
+				log.Println("signature invalid")
+				return
+			}
+
+			log.Println("✅ assinatura válida, criando ssh connection para", addr, "com user", user)
+
+			once.Do(func() {
+				startSSHSession(conn, user, addr, goPub)
+			})
+		}
+	}
+}
+
+func startSSHSession(conn *websocket.Conn, user, addr string, pub ed25519.PublicKey) {
+	signer := &remoteSigner{
+		pub:     pub,
+		ws:      conn,
+		comment: "remote-browser",
+	}
+
+	sshConfig := &ssh.ClientConfig{
+		User: user,
+		Auth: []ssh.AuthMethod{
+			ssh.PublicKeys(signer),
+		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         10 * time.Second,
+	}
+
+	realConn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		log.Println("dial tcp error:", err)
+		return
+	}
+	defer realConn.Close()
+
+	clientConn, chans, reqs, err := ssh.NewClientConn(realConn, addr, sshConfig)
+	if err != nil {
+		log.Println("ssh connect error:", err)
+		return
+	}
+	client := ssh.NewClient(clientConn, chans, reqs)
+	defer client.Close()
+
+	sess, err := client.NewSession()
+	if err != nil {
+		log.Println("new session error:", err)
+		return
+	}
+	defer sess.Close()
+
+	sess.Stdout = &wsWriter{conn}
+	sess.Stderr = &wsWriter{conn}
+	stdin, _ := sess.StdinPipe()
+
+	go func() {
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				log.Println("stdin pipe read error:", err)
+				return
+			}
+			var input Message
+			if json.Unmarshal(msg, &input) == nil && input.Type == "input" {
+				stdin.Write([]byte(input.Data))
+			}
+		}
+	}()
+
+	sess.Shell()
+	sess.Wait()
+}
+
+// remoteSigner e wsWriter permanecem iguais...
